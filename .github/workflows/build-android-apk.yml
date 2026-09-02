@@ -4,12 +4,16 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  id-token: write
 
 jobs:
   build-apk:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      VERSION_CODE: ${{ github.run_number }}
+      VERSION_NAME: 1.0.${{ github.run_number }}
 
     steps:
       - name: Checkout repository
@@ -28,16 +32,85 @@ jobs:
           java-version: '21'
           cache: gradle
 
+      - name: Fetch stable Android signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          OIDC_JSON="$(curl -fsSL \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=polaris-android-signing")"
+          ID_TOKEN="$(printf '%s' "$OIDC_JSON" | jq -r '.value')"
+          test -n "$ID_TOKEN" && test "$ID_TOKEN" != "null"
+
+          SIGNING_JSON="$(curl -fsSL \
+            -H "Authorization: Bearer ${ID_TOKEN}" \
+            'https://tsawfgrpnmwmcvdivkua.supabase.co/functions/v1/polaris-android-signing')"
+
+          mkdir -p "$HOME/.android"
+          printf '%s' "$SIGNING_JSON" | jq -r '.keystoreBase64' | base64 -d > "$HOME/.android/debug.keystore"
+          chmod 600 "$HOME/.android/debug.keystore"
+          keytool -list \
+            -keystore "$HOME/.android/debug.keystore" \
+            -storepass android \
+            -alias androiddebugkey >/dev/null
+
+      - name: Set Android version
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path('android/app/build.gradle')
+          text = path.read_text(encoding='utf-8')
+          code = os.environ['VERSION_CODE']
+          name = os.environ['VERSION_NAME']
+          text, n1 = re.subn(r'(?m)^(\s*)versionCode\s+\d+\s*$', rf'\1versionCode {code}', text, count=1)
+          text, n2 = re.subn(r'(?m)^(\s*)versionName\s+"[^"]+"\s*$', rf'\1versionName "{name}"', text, count=1)
+          if n1 != 1 or n2 != 1:
+              raise SystemExit('Could not update Android versionCode/versionName')
+          path.write_text(text, encoding='utf-8')
+          PY
+
       - name: Install dependencies
         run: npm ci
 
       - name: Build debug APK
         run: npm run android:build-debug
 
-      - name: Upload APK
+      - name: Prepare APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          APK="$(find android/app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' | head -n 1)"
+          test -n "$APK"
+          cp "$APK" dist/polaris-android-debug.apk
+          sha256sum dist/polaris-android-debug.apk > dist/polaris-android-debug.apk.sha256
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: polaris-android-debug
-          path: android/app/build/outputs/apk/debug/*.apk
+          path: |
+            dist/polaris-android-debug.apk
+            dist/polaris-android-debug.apk.sha256
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish latest sideload release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="android-v${VERSION_CODE}"
+          gh release delete "$TAG" --cleanup-tag --yes >/dev/null 2>&1 || true
+          gh release create "$TAG" \
+            dist/polaris-android-debug.apk \
+            dist/polaris-android-debug.apk.sha256 \
+            --target "${GITHUB_SHA}" \
+            --title "Polaris Android ${VERSION_NAME}-debug" \
+            --notes $'- Android sideload build\n- Stable signing enabled\n- In-app update source enabled' \
+            --latest
