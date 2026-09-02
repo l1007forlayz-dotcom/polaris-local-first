@@ -1,4 +1,4 @@
-export const ANDROID_APK_UPDATE_MANIFEST_URL = '';
+export const ANDROID_APK_UPDATE_MANIFEST_URL = 'https://tsawfgrpnmwmcvdivkua.supabase.co/functions/v1/polaris-android-update?key=bmJHyrqpZYnHHbWrbHy1HXC_uM3WD8eDsWUR1p-xRNI';
 
 export type AndroidApkUpdateManifest = {
   platform: 'android';
